@@ -6,12 +6,14 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"github.com/arunsworld/nursery"
 	"github.com/gliderlabs/ssh"
+	probing "github.com/prometheus-community/pro-bing"
 	"github.com/urfave/cli/v2"
 )
 
@@ -90,21 +92,7 @@ func run(ctx context.Context, authUsers *auth, conf config) error {
 	}
 
 	if conf.allowSession {
-		server.Handler = func(s ssh.Session) {
-			sessionCtx := s.Context()
-			log.Printf("Session handler started: user: %s. environ: %v. session: %s. commands: %s", s.User(), s.Environ(), sessionCtx.SessionID(), s.Command())
-			if len(s.Command()) == 1 && s.Command()[0] == "sleep" {
-				io.WriteString(s, "SESSION STARTED... BLOCKING...\n")
-				select {
-				case <-sessionCtx.Done():
-				case <-ctx.Done():
-					io.WriteString(s, "server shutting down\n")
-				}
-			} else {
-				io.WriteString(s, "SESSION DISALLOWED...\n")
-			}
-			log.Printf("Session handler ended: user: %s. environ: %v. session: %s", s.User(), s.Environ(), s.Context().SessionID())
-		}
+		server.Handler = sessionHandler
 	} else {
 		server.Handler = func(s ssh.Session) {
 			io.WriteString(s, "SESSION DISALLOWED\n")
@@ -190,4 +178,86 @@ func run(ctx context.Context, authUsers *auth, conf config) error {
 			}
 		},
 	)
+}
+
+func sessionHandler(s ssh.Session) {
+	sessionCtx := s.Context()
+	log.Printf("Session handler started: user: %s. environ: %v. session: %s. commands: %s", s.User(), s.Environ(), sessionCtx.SessionID(), s.Command())
+
+	var sessionErr error
+
+	defer func() {
+		log.Printf("Session handler ended: user: %s. environ: %v. session: %s. error: %v", s.User(), s.Environ(), s.Context().SessionID(), sessionErr)
+	}()
+
+	var cmd *exec.Cmd
+	inputCommand := s.Command()
+	switch {
+	case len(inputCommand) == 0:
+		cmd = exec.CommandContext(sessionCtx, "sh")
+	case len(inputCommand) == 1:
+		cmd = exec.CommandContext(sessionCtx, inputCommand[0])
+	case inputCommand[0] == "ping":
+		if err := doPing(s, inputCommand[1]); err != nil {
+			fmt.Fprintf(s, "ERROR executing ping: %v", err)
+		}
+		return
+	default:
+		cmd = exec.CommandContext(sessionCtx, inputCommand[0], inputCommand[1:]...)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		sessionErr = err
+		fmt.Fprintf(s, "ERROR executing command connecting to pipe: %v", err)
+		return
+	}
+	if err := cmd.Start(); err != nil {
+		sessionErr = err
+		fmt.Fprintf(s, "ERROR executing command: %v", err)
+		return
+	}
+	if _, err := io.Copy(s, stdout); err != nil {
+		sessionErr = err
+		fmt.Fprintf(s, "ERROR executing command - copy error: %v", err)
+		return
+	}
+	if err := cmd.Wait(); err != nil {
+		sessionErr = err
+		fmt.Fprintf(s, "ERROR executing command - on wait: %v", err)
+		return
+	}
+}
+
+func doPing(s ssh.Session, target string) error {
+	pinger, err := probing.NewPinger(target)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithCancel(s.Context())
+	defer cancel()
+	go func() {
+		<-ctx.Done()
+		pinger.Stop()
+	}()
+	pinger.Count = 3
+	pinger.OnRecv = func(pkt *probing.Packet) {
+		fmt.Fprintf(s, "%d bytes from %s: icmp_seq=%d time=%v\n",
+			pkt.Nbytes, pkt.IPAddr, pkt.Seq, pkt.Rtt)
+	}
+	pinger.OnDuplicateRecv = func(pkt *probing.Packet) {
+		fmt.Fprintf(s, "%d bytes from %s: icmp_seq=%d time=%v ttl=%v (DUP!)\n",
+			pkt.Nbytes, pkt.IPAddr, pkt.Seq, pkt.Rtt, pkt.TTL)
+	}
+	pinger.OnFinish = func(stats *probing.Statistics) {
+		fmt.Fprintf(s, "\n--- %s ping statistics ---\n", stats.Addr)
+		fmt.Fprintf(s, "%d packets transmitted, %d packets received, %v%% packet loss\n",
+			stats.PacketsSent, stats.PacketsRecv, stats.PacketLoss)
+		fmt.Fprintf(s, "round-trip min/avg/max/stddev = %v/%v/%v/%v\n",
+			stats.MinRtt, stats.AvgRtt, stats.MaxRtt, stats.StdDevRtt)
+	}
+	fmt.Fprintf(s, "PING %s (%s):\n", pinger.Addr(), pinger.IPAddr())
+	if err := pinger.Run(); err != nil {
+		return err
+	}
+	return nil
 }
