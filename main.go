@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -202,6 +204,14 @@ func sessionHandler(s ssh.Session) {
 			fmt.Fprintf(s, "ERROR executing ping: %v", err)
 		}
 		return
+	case inputCommand[0] == "check":
+		address := inputCommand[1]
+		if strings.ContainsAny(address, ":") {
+			doNC(s, inputCommand[1])
+		} else {
+			doResolv(s, inputCommand[1])
+		}
+		return
 	default:
 		cmd = exec.CommandContext(sessionCtx, inputCommand[0], inputCommand[1:]...)
 	}
@@ -260,4 +270,27 @@ func doPing(s ssh.Session, target string) error {
 		return err
 	}
 	return nil
+}
+
+func doNC(s ssh.Session, address string) {
+	conn, err := net.DialTimeout("tcp", address, time.Second)
+	if err != nil {
+		fmt.Fprintf(s, "\nNOT OK: unable to connect to %s: %v\n\n", address, err)
+		return
+	}
+	conn.Close()
+	fmt.Fprintf(s, "\nOK: network port %s is open\n\n", address)
+}
+
+func doResolv(s ssh.Session, address string) {
+	ips, err := net.LookupIP(address)
+	if err != nil {
+		fmt.Fprintf(s, "\nNOT OK: unable to resolve %s: %v\n\n", address, err)
+		return
+	}
+	result := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		result = append(result, ip.String())
+	}
+	fmt.Fprintf(s, "\nOK: resolved %s to %s\n\n", address, strings.Join(result, ", "))
 }
